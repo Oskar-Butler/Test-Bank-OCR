@@ -59,6 +59,7 @@ from google.cloud import documentai_v1 as documentai
 from google.api_core.client_options import ClientOptions
 from google.cloud import storage, secretmanager
 from google import genai
+import uuid
 
 print("✅ Imports successful")
 
@@ -90,6 +91,11 @@ GEMINI_MAX_TOKENS = 6000
 GEMINI_WAIT_SECONDS = 15
 GEMINI_RETRIES = 3
 GEMINI_DELAY = 5.0
+
+# Bucket to upload files to for batch processing
+DOCAI_STAGING_BUCKET = "document-ai-batch" 
+# GCS path (folder) for DocAI to write its JSON results to
+DOCAI_BATCH_OUTPUT_GCS_PATH = "gs://document-ai-batch/ocr-results/"
 
 print("✅ Config set")
 
@@ -160,19 +166,6 @@ def should_process_file(url: str):
     except Exception as e:
         return False, f"Failed to download or validate: {e}", None
 
-def extract_document(file_content: bytes, mime_type: str):
-    try:
-        request = {
-            "name": processor_name,
-            "raw_document": {"content": file_content, "mime_type": mime_type}
-        }
-        result = docai_client.process_document(request=request)
-        text = result.document.text.strip()
-        return text, bool(text)
-    except Exception as e:
-        print(f"❌ Document AI Error: {e}")
-        return "", False
-
 # ============================
 # LOAD EXCEL AND VALIDATE FILES
 # ============================
@@ -204,85 +197,180 @@ if rejected_files:
 print(f"✅ {len(approved_files)} files approved for processing\n")
 
 # ============================
-# DOCUMENT AI BATCH PROCESSING
+# NEW HELPER FUNCTIONS (Add these)
 # ============================
-current_batch, batch_pages, batch_number = [], 0, 1
-rejected_due_to_pages = []
-invoice_texts = []
+def get_blob_from_gcs_uri(gcs_uri):
+    """Helper to get a blob object from a full gs:// URI."""
+    parts = gcs_uri.replace("gs://", "").split("/", 1)
+    bucket_name = parts[0]
+    blob_name = parts[1]
+    return storage_client.bucket(bucket_name).blob(blob_name)
 
-for idx, url, file_bytes in approved_files:
+def extract_text_from_docai_json(document: documentai.Document) -> str:
+    """
+    Robust text extraction. Fixes the bug where document.text is empty.
+    Tries document.text first, then falls back to iterating pages.
+    """
+    if document.text:
+        return document.text.strip()
+
+    # Fallback: assemble text from pages
+    all_text = []
+    if document.pages:
+        for page in document.pages:
+            if page.paragraphs:
+                for paragraph in page.paragraphs:
+                    if (paragraph.layout and 
+                        paragraph.layout.text_anchor and 
+                        paragraph.layout.text_anchor.text_segments):
+                        
+                        start = paragraph.layout.text_anchor.text_segments[0].start_index or 0
+                        end = paragraph.layout.text_anchor.text_segments[0].end_index or 0
+                        if end > start:
+                            all_text.append(document.text[start:end])
+    
+    return "\n".join(all_text).strip()
+
+# ============================
+# DOCUMENT AI BATCH PROCESSING (CORRECTED)
+# ============================
+
+# --- 1. Stage all approved files in GCS ---
+print(f"--- Staging {len(approved_files)} files for batch processing ---")
+batch_input_configs = []
+staged_file_map = {} # FIX: Map filename -> {row, url}
+staged_gcs_uris = [] # List of full URIs for cleanup
+
+staging_bucket = storage_client.bucket(DOCAI_STAGING_BUCKET)
+
+for idx, url, file_bytes in tqdm(approved_files, desc="Staging files"):
     ext = url.lower().split('.')[-1]
     mime_type = {
-        "pdf": "application/pdf",
-        "png": "image/png",
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "tiff": "image/tiff"
+        "pdf": "application/pdf", "png": "image/png",
+        "jpg": "image/jpeg", "jpeg": "image/jpeg", "tiff": "image/tiff"
     }.get(ext, "application/octet-stream")
     
-    pages = 1
-    if ext == "pdf":
-        pages = len(PdfReader(io.BytesIO(file_bytes)).pages)
+    staged_file_name = f"row-{idx}-{uuid.uuid4()}.{ext}"
+    
+    blob = staging_bucket.blob(staged_file_name)
+    blob.upload_from_string(file_bytes, content_type=mime_type)
+    
+    gcs_uri = f"gs://{DOCAI_STAGING_BUCKET}/{staged_file_name}"
+    staged_gcs_uris.append(gcs_uri) # For cleanup
+    
+    batch_input_configs.append(
+        documentai.GcsDocument(gcs_uri=gcs_uri, mime_type=mime_type)
+    )
+    
+    # FIX: Use the FILENAME as the key
+    staged_file_map[staged_file_name] = {"row": idx, "url": url}
 
-    if batch_pages + pages > DOCAI_MAX_BATCH_PAGES:
-        rejected_due_to_pages.append({"row": idx, "url": url, "reason": f"Exceeded batch page quota ({pages})"})
-        print(f"Row {idx}: ❌ SKIPPED due to batch page limit ({pages})")
-        continue
+print(f"✅ {len(batch_input_configs)} files staged in gs://{DOCAI_STAGING_BUCKET}/\n")
 
-    current_batch.append((idx, url, file_bytes, mime_type, pages))
-    batch_pages += pages
-    print(f"Row {idx}: Added to batch {batch_number} ({batch_pages} pages)")
 
-    # Process batch if full or page limit reached
-    if len(current_batch) >= DOCAI_BATCH_SIZE or batch_pages >= DOCAI_MAX_BATCH_PAGES:
-        print(f"\n--- Processing Batch {batch_number} ({len(current_batch)} files, {batch_pages} pages) ---")
+# --- 2. Run the Asynchronous Batch Job ---
+operation_id = None
+if batch_input_configs:
+    print(f"--- Starting Document AI batch job for {len(batch_input_configs)} files ---")
+    
+    output_config = documentai.DocumentOutputConfig(
+        gcs_output_config={"gcs_uri": DOCAI_BATCH_OUTPUT_GCS_PATH}
+    )
+    
+    request = documentai.BatchProcessRequest(
+        name=processor_name,
+        input_documents=documentai.BatchDocumentsInputConfig(
+            gcs_documents=documentai.GcsDocuments(documents=batch_input_configs)
+        ),
+        document_output_config=output_config,
+    )
+
+    operation = docai_client.batch_process_documents(request)
+    
+    # FIX: Capture the Operation ID from the full name
+    operation_id = operation.operation.name.split('/')[-1]
+    print(f"Job started. Waiting for completion... (Operation: {operation.operation.name})")
+    
+    try:
+        operation.result(timeout=1800) # Wait up to 30 mins
+        print("✅ Document AI batch job complete.\n")
+    except Exception as e:
+        print(f"❌ Document AI batch job failed: {e}")
+        raise
+else:
+    print("No files to process.")
+
+
+# --- 3. Parse JSON results from GCS output ---
+invoice_texts = [] # This will feed into your Gemini section
+
+if operation_id: # Only parse if we ran a job
+    # FIX: Use the operation_id to build the correct parsing prefix
+    base_prefix = DOCAI_BATCH_OUTPUT_GCS_PATH.replace("gs://", "").split("/", 1)[1]
+    parse_prefix = f"{base_prefix}{operation_id}"
+    output_bucket_name = DOCAI_BATCH_OUTPUT_GCS_PATH.split("/")[2]
+    output_bucket = storage_client.bucket(output_bucket_name)
+
+    print(f"--- Parsing results from gs://{output_bucket_name}/{parse_prefix}/ ---")
+    blobs = list(output_bucket.list_blobs(prefix=parse_prefix))
+
+    if not blobs:
+        print(f"⚠️ WARNING: No result files found matching prefix '{parse_prefix}'.")
+
+    for blob in tqdm(blobs, desc="Parsing results"):
+        if not blob.name.endswith(".json"):
+            continue
+
+        doc_json = blob.download_as_string()
+        document = documentai.Document.from_json(doc_json, ignore_unknown_fields=True)
         
-        # Simple progress bar
-        total_files = len(current_batch)
-        for i, (ri, rurl, rbytes, rmime, rpages) in enumerate(current_batch, start=1):
-            text, used = extract_document(rbytes, rmime)
-            if text:
-                invoice_texts.append({"row": ri, "url": rurl, "text": text})
+        # FIX: Get the filename from the document.uri
+        original_filename = document.uri.split('/')[-1]
+        
+        # FIX: Check if this filename is in our map
+        if original_filename in staged_file_map:
+            # Use the robust text extractor
+            doc_text = extract_text_from_docai_json(document)
             
-            # Print progress bar
-            percent = int(i / total_files * 100)
-            bar = '#' * (percent // 5) + '-' * (20 - percent // 5)
-            print(f"\rProcessing file {i}/{total_files} | [{bar}] {percent}%", end='')
-        
-        print("\nBatch complete.\n")
-        current_batch, batch_pages, batch_number = [], 0, batch_number + 1
-        time.sleep(DOCAI_WAIT_SECONDS)
+            if doc_text:
+                original_info = staged_file_map[original_filename]
+                invoice_texts.append({
+                    "row": original_info["row"],
+                    "url": original_info["url"],
+                    "text": doc_text
+                })
+            else:
+                print(f"W: File {original_filename} (Row {staged_file_map[original_filename]['row']}) processed but had no text.")
+        else:
+            # This is just a page shard or other artifact, ignore it
+            pass
 
-# Final batch
-if current_batch:
-    print(f"\n--- Processing Final Batch {batch_number} ({len(current_batch)} files) ---")
-    total_files = len(current_batch)
-    for i, (ri, rurl, rbytes, rmime, rpages) in enumerate(current_batch, start=1):
-        text, used = extract_document(rbytes, rmime)
-        if text:
-            invoice_texts.append({"row": ri, "url": rurl, "text": text})
-        
-        percent = int(i / total_files * 100)
-        bar = '#' * (percent // 5) + '-' * (20 - percent // 5)
-        print(f"\rProcessing file {i}/{total_files} | [{bar}] {percent}%", end='')
+    # --- Clean up staged files ---
+    print("Cleaning up staged files...")
+    try:
+        for gcs_uri in staged_gcs_uris:
+            get_blob_from_gcs_uri(gcs_uri).delete()
+        print("✅ Staging cleanup complete.")
+    except Exception as e:
+        print(f"W: Failed to cleanup staged files: {e}")
+else:
+    print("--- Skipping parsing as no job was run. ---")
 
-    print("\nFinal batch complete.\n")
 
-# ============================
-# TRACKER SUMMARY
-# ============================
+# --- TRACKER SUMMARY (Replaces your old one) ---
 print("\n--- Processing Summary ---")
 print(f"Total rows in Excel: {len(df)}")
 print(f"Approved files: {len(approved_files)}")
 print(f"Rejected files: {len(rejected_files)}")
-print(f"Skipped due to batch page quota: {len(rejected_due_to_pages)}")
+# print(f"Skipped due to batch page quota: {len(rejected_due_to_pages)}") # This is from your old code, no longer needed
 print(f"Documents successfully processed: {len(invoice_texts)}")
 
 # Optional: save all extracted texts
-extracted_df = pd.DataFrame(invoice_texts)
-storage_client.bucket("ocr-bank-extractor-bucket").blob("extracted_invoices.csv") \
-    .upload_from_string(extracted_df.to_csv(index=False), content_type="text/csv")
-print("✅ All extracted texts saved to GCS")
+if invoice_texts:
+    extracted_df = pd.DataFrame(invoice_texts)
+    storage_client.bucket("ocr-bank-extractor-bucket").blob("extracted_invoices.csv") \
+        .upload_from_string(extracted_df.to_csv(index=False), content_type="text/csv")
+    print("✅ All extracted texts saved to GCS")
 
 # ============================
 # GEMINI EXTRACTION HELPER
