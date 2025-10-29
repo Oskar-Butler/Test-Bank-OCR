@@ -1,0 +1,523 @@
+# ============================
+# cell 1: install dependencies into the current Python interpreter
+# ============================
+import sys, subprocess, importlib
+
+# --- Core dependencies (excluding storage for now to control version) ---
+packages = [
+    "google-cloud-documentai",
+    "google-cloud-secret-manager",
+    "google-genai",
+    "pandas",
+    "requests",
+    "pypdf",     # for PDF page count
+    "Pillow"     # for image dimensions
+]
+
+# Install core packages
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade"] + packages)
+
+# --- Fix known dependency conflict ---
+# google-cloud-aiplatform requires google-cloud-storage <3.0.0
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "google-cloud-storage<3.0.0,>=1.32.0"])
+
+print("✅ Installed compatible Google Cloud + OCR packages to:", sys.executable)
+
+# --- Verify key imports ---
+for pkg in ["google.cloud.documentai_v1", "google.cloud.storage", "pandas", "requests", "pypdf", "PIL"]:
+    try:
+        importlib.import_module(pkg)
+        print(f"✅ {pkg} imported successfully.")
+    except ImportError:
+        print(f"❌ {pkg} failed to import.")
+
+# --- Optional: check versions ---
+try:
+    import google.cloud.storage, google.cloud.documentai_v1
+    print("\nVersion check:")
+    print(" - google-cloud-storage:", google.cloud.storage.__version__)
+    print(" - google-cloud-documentai:", google.cloud.documentai_v1.__version__)
+except Exception as e:
+    print("⚠️ Version check skipped:", e)
+
+import logging
+# Suppress pypdf warnings
+logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
+
+print("✅ Imports successful")
+
+# ============================
+# IMPORTS
+# ============================
+import os, io, json, time, random, math, re
+import pandas as pd
+import requests
+from pypdf import PdfReader
+from PIL import Image
+from tqdm import tqdm
+from google.cloud import documentai_v1 as documentai
+from google.api_core.client_options import ClientOptions
+from google.cloud import storage, secretmanager
+from google import genai
+
+print("✅ Imports successful")
+
+# ============================
+# CONFIG
+# ============================
+PROJECT_ID = "75850893897"
+LOCATION = "eu"
+PROCESSOR_ID = "ca36b8780a644f9e"
+EXCEL_GCS_PATH = "gs://ocr-bank-extractor-bucket/AI Task.xlsx"
+EXPORT_BUCKET_NAME = "bank_ocr_output"
+FILE_OVERWRITE_NAME = "bank_ocr_output.csv"
+SECRET_NAME = "API_KEY"
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# Pre-processing thresholds
+MAX_PDF_PAGES = 4
+MIN_IMAGE_WIDTH = 400
+MIN_IMAGE_HEIGHT = 400
+ALLOWED_EXTENSIONS = ['.pdf', '.png', '.jpg', '.jpeg', '.tiff']
+
+# Batch settings
+DOCAI_BATCH_SIZE = 100
+DOCAI_MAX_BATCH_PAGES = 100
+DOCAI_WAIT_SECONDS = 60
+
+GEMINI_BATCH_SIZE = 15
+GEMINI_MAX_TOKENS = 6000
+GEMINI_WAIT_SECONDS = 15
+GEMINI_RETRIES = 3
+GEMINI_DELAY = 5.0
+
+print("✅ Config set")
+
+# ============================
+# LOAD GEMINI API KEY
+# ============================
+def load_gemini_key(project_id: str, secret_name: str) -> str:
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key:
+        return env_key
+
+    secret_path = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+    client = secretmanager.SecretManagerServiceClient()
+    response = client.access_secret_version(request={"name": secret_path})
+    return response.payload.data.decode("utf-8")
+
+gemini_api_key = load_gemini_key(PROJECT_ID, SECRET_NAME)
+gemini_client = genai.Client(api_key=gemini_api_key)
+print("✅ Gemini client initialized")
+
+# ============================
+# INITIALIZE GOOGLE CLIENTS
+# ============================
+docai_client = documentai.DocumentProcessorServiceClient(
+    client_options=ClientOptions(api_endpoint=f"{LOCATION}-documentai.googleapis.com")
+)
+processor_name = docai_client.processor_path(PROJECT_ID, LOCATION, PROCESSOR_ID)
+storage_client = storage.Client()
+print("✅ DocumentAI and Storage clients initialized")
+
+# ============================
+# HELPER FUNCTIONS
+# ============================
+def parse_gcs_url(url: str):
+    parts = url[5:].split("/", 1)
+    if len(parts) != 2:
+        raise ValueError(f"GCS URL missing blob path: {url}")
+    return parts[0], parts[1]
+
+def should_process_file(url: str):
+    try:
+        if url.lower().startswith("gs://"):
+            bucket_name, blob_name = parse_gcs_url(url)
+            blob = storage_client.bucket(bucket_name).blob(blob_name)
+            file_bytes = blob.download_as_bytes()
+        elif url.lower().startswith("http"):
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            file_bytes = r.content
+        else:
+            return False, f"Unsupported URL format: {url}", None
+
+        ext = '.' + url.split('.')[-1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            return False, f"File type not allowed: {ext}", file_bytes
+
+        if ext == '.pdf':
+            reader = PdfReader(io.BytesIO(file_bytes))
+            if len(reader.pages) > MAX_PDF_PAGES:
+                return False, f"PDF too long ({len(reader.pages)} pages)", file_bytes
+        elif ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+            with Image.open(io.BytesIO(file_bytes)) as img:
+                w, h = img.size
+                if w < MIN_IMAGE_WIDTH or h < MIN_IMAGE_HEIGHT:
+                    return False, f"Image too small ({w}x{h})", file_bytes
+
+        return True, "File approved", file_bytes
+    except Exception as e:
+        return False, f"Failed to download or validate: {e}", None
+
+def extract_document(file_content: bytes, mime_type: str):
+    try:
+        request = {
+            "name": processor_name,
+            "raw_document": {"content": file_content, "mime_type": mime_type}
+        }
+        result = docai_client.process_document(request=request)
+        text = result.document.text.strip()
+        return text, bool(text)
+    except Exception as e:
+        print(f"❌ Document AI Error: {e}")
+        return "", False
+
+# ============================
+# LOAD EXCEL AND VALIDATE FILES
+# ============================
+bucket_name, blob_name = parse_gcs_url(EXCEL_GCS_PATH)
+blob = storage_client.bucket(bucket_name).blob(blob_name)
+df = pd.read_excel(io.BytesIO(blob.download_as_bytes()))
+print(f"✅ Excel loaded: {len(df)} rows found\n")
+
+approved_files, rejected_files = [], []
+
+print("--- Validating files ---")
+for i, row in df.iterrows():
+    url = row['Link']
+    can_process, reason, file_bytes = should_process_file(url)
+    if can_process:
+        approved_files.append((i+1, url, file_bytes))
+        print(f"Row {i+1}: ✅ APPROVED -> {reason}")
+    else:
+        rejected_files.append({"row": i+1, "url": url, "reason": reason})
+        print(f"Row {i+1}: ❌ REJECTED -> {reason}")
+
+# Save rejected files
+if rejected_files:
+    rejected_df = pd.DataFrame(rejected_files)
+    storage_client.bucket("ocr-bank-extractor-bucket").blob("rejected_files.csv") \
+        .upload_from_string(rejected_df.to_csv(index=False), content_type="text/csv")
+    print(f"✅ {len(rejected_files)} rejected files saved to GCS\n")
+
+print(f"✅ {len(approved_files)} files approved for processing\n")
+
+# ============================
+# DOCUMENT AI BATCH PROCESSING
+# ============================
+current_batch, batch_pages, batch_number = [], 0, 1
+rejected_due_to_pages = []
+invoice_texts = []
+
+for idx, url, file_bytes in approved_files:
+    ext = url.lower().split('.')[-1]
+    mime_type = {
+        "pdf": "application/pdf",
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "tiff": "image/tiff"
+    }.get(ext, "application/octet-stream")
+    
+    pages = 1
+    if ext == "pdf":
+        pages = len(PdfReader(io.BytesIO(file_bytes)).pages)
+
+    if batch_pages + pages > DOCAI_MAX_BATCH_PAGES:
+        rejected_due_to_pages.append({"row": idx, "url": url, "reason": f"Exceeded batch page quota ({pages})"})
+        print(f"Row {idx}: ❌ SKIPPED due to batch page limit ({pages})")
+        continue
+
+    current_batch.append((idx, url, file_bytes, mime_type, pages))
+    batch_pages += pages
+    print(f"Row {idx}: Added to batch {batch_number} ({batch_pages} pages)")
+
+    # Process batch if full or page limit reached
+    if len(current_batch) >= DOCAI_BATCH_SIZE or batch_pages >= DOCAI_MAX_BATCH_PAGES:
+        print(f"\n--- Processing Batch {batch_number} ({len(current_batch)} files, {batch_pages} pages) ---")
+        
+        # Simple progress bar
+        total_files = len(current_batch)
+        for i, (ri, rurl, rbytes, rmime, rpages) in enumerate(current_batch, start=1):
+            text, used = extract_document(rbytes, rmime)
+            if text:
+                invoice_texts.append({"row": ri, "url": rurl, "text": text})
+            
+            # Print progress bar
+            percent = int(i / total_files * 100)
+            bar = '#' * (percent // 5) + '-' * (20 - percent // 5)
+            print(f"\rProcessing file {i}/{total_files} | [{bar}] {percent}%", end='')
+        
+        print("\nBatch complete.\n")
+        current_batch, batch_pages, batch_number = [], 0, batch_number + 1
+        time.sleep(DOCAI_WAIT_SECONDS)
+
+# Final batch
+if current_batch:
+    print(f"\n--- Processing Final Batch {batch_number} ({len(current_batch)} files) ---")
+    total_files = len(current_batch)
+    for i, (ri, rurl, rbytes, rmime, rpages) in enumerate(current_batch, start=1):
+        text, used = extract_document(rbytes, rmime)
+        if text:
+            invoice_texts.append({"row": ri, "url": rurl, "text": text})
+        
+        percent = int(i / total_files * 100)
+        bar = '#' * (percent // 5) + '-' * (20 - percent // 5)
+        print(f"\rProcessing file {i}/{total_files} | [{bar}] {percent}%", end='')
+
+    print("\nFinal batch complete.\n")
+
+# ============================
+# TRACKER SUMMARY
+# ============================
+print("\n--- Processing Summary ---")
+print(f"Total rows in Excel: {len(df)}")
+print(f"Approved files: {len(approved_files)}")
+print(f"Rejected files: {len(rejected_files)}")
+print(f"Skipped due to batch page quota: {len(rejected_due_to_pages)}")
+print(f"Documents successfully processed: {len(invoice_texts)}")
+
+# Optional: save all extracted texts
+extracted_df = pd.DataFrame(invoice_texts)
+storage_client.bucket("ocr-bank-extractor-bucket").blob("extracted_invoices.csv") \
+    .upload_from_string(extracted_df.to_csv(index=False), content_type="text/csv")
+print("✅ All extracted texts saved to GCS")
+
+# ============================
+# GEMINI EXTRACTION HELPER
+# ============================
+
+
+# --- Step 1: Settings ---
+BATCH_SIZE = GEMINI_BATCH_SIZE           # Max invoices per Gemini call
+MAX_TOKENS_PER_BATCH = GEMINI_MAX_TOKENS # Safe token budget per batch
+WAIT_SECONDS = GEMINI_WAIT_SECONDS       # Delay between batches (seconds)
+RETRIES = GEMINI_RETRIES
+DELAY = GEMINI_DELAY
+
+# --- Step 2: Token estimation function ---
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: 1 token per word (safe approximation)."""
+    return len(text.split())
+
+# --- Step 3: Gemini batch helper ---
+def extract_with_gemini_batch(texts: list) -> list:
+    """Call Gemini for a batch of invoice texts, retrying if overloaded."""
+    all_results = []
+
+    if not texts:
+        return all_results
+
+    prompt = (
+        "You are a financial document expert.\n"
+        "Extract the following fields from each invoice text:\n"
+        "- Account Name\n- Sort Code (if any)\n- Account Number\n- IBAN (if any)\n\n"
+        "Return a JSON array where each element corresponds to an invoice in the same order, "
+        "each element having exact keys: \"Account_Name\", \"Sort_Code\", \"Account_Number\", \"IBAN\".\n\n"
+        "Invoices:\n"
+    )
+    
+    for idx, txt in enumerate(texts, start=1):
+        prompt += f"\nInvoice {idx}:\n---{txt}---\n"
+
+    for attempt in range(1, RETRIES + 1):
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+            batch_results = json.loads(response.text)
+
+            if isinstance(batch_results, list) and len(batch_results) == len(texts):
+                all_results.extend(batch_results)
+            else:
+                raise ValueError("Unexpected Gemini response format.")
+
+            print(f"✅ Gemini batch processed successfully ({len(texts)} invoices).")
+            break
+
+        except Exception as e:
+            if "503" in str(e) and attempt < RETRIES:
+                wait = DELAY * attempt + random.uniform(0, 3)
+                print(f"⚠️ Gemini overloaded (attempt {attempt}/{RETRIES}). Retrying in {wait:.1f}s...")
+                time.sleep(wait)
+                continue
+
+            print(f"❌ Gemini extraction failed after {attempt} attempts: {e}")
+            all_results.extend([{"Account_Name": None, "Sort_Code": None, "Account_Number": None, "IBAN": None} for _ in texts])
+            break
+
+    return all_results
+
+# --- Step 4: Safe batch processing with token limits ---
+all_results = []
+current_batch_texts = []
+current_batch_tokens = 0
+batch_number = 1
+
+for idx, text in enumerate(invoice_texts, start=1):
+    tokens = estimate_tokens(text)
+    print(f"Invoice {idx}: ~{tokens} tokens")
+
+    # If adding this invoice exceeds token budget and current batch not empty, process it first
+    if current_batch_tokens + tokens > MAX_TOKENS_PER_BATCH and current_batch_texts:
+        print(f"\n--- Processing Gemini batch {batch_number} ({len(current_batch_texts)} invoices, ~{current_batch_tokens} tokens) ---")
+        start_time = time.time()
+        batch_results = extract_with_gemini_batch(current_batch_texts)
+        all_results.extend(batch_results)
+        print(f"⏱ Batch {batch_number} done in {time.time() - start_time:.1f}s")
+        time.sleep(WAIT_SECONDS)
+        current_batch_texts = []
+        current_batch_tokens = 0
+        batch_number += 1
+
+    # Add current invoice to batch (even if it alone exceeds token budget)
+    current_batch_texts.append(text)
+    current_batch_tokens += tokens
+
+# --- Step 5: Process remaining invoices ---
+if current_batch_texts:
+    print(f"\n--- Processing final Gemini batch {batch_number} ({len(current_batch_texts)} invoices, ~{current_batch_tokens} tokens) ---")
+    start_time = time.time()
+    batch_results = extract_with_gemini_batch(current_batch_texts)
+    all_results.extend(batch_results)
+    print(f"⏱ Final batch done in {time.time() - start_time:.1f}s")
+
+# --- Step 6: Summary ---
+success_count = sum(1 for r in all_results if any(r.values()))
+failure_count = len(all_results) - success_count
+print(f"\n✅ Gemini extraction completed for {len(invoice_texts)} invoices.")
+print(f"✅ Successful extractions: {success_count}")
+print(f"❌ Failed extractions: {failure_count}")
+
+# ============================
+# REGEX VALIDATION / CLEANUP + PREVIEW
+# ============================
+
+import re
+import pandas as pd
+
+def validate_and_clean_fields(data: dict) -> dict:
+    """Clean and validate extracted fields using regex."""
+    clean = {}
+    
+    # Keep row info if exists
+    clean["_row"] = data.get("_row", None)
+
+    # --- Account Name ---
+    name = data.get("Account_Name")
+    clean["Account_Name"] = re.sub(r"[^A-Za-z0-9\s&'.-]", "", name).strip() if name else None
+
+    # --- Sort Code (UK format) ---
+    sort_code = data.get("Sort_Code")
+    if sort_code:
+        sc_match = re.search(r"\b\d{2}[- ]?\d{2}[- ]?\d{2}\b", str(sort_code))
+        clean["Sort_Code"] = re.sub(r"[- ]", "", sc_match.group(0)) if sc_match else None
+    else:
+        clean["Sort_Code"] = None
+
+    # --- Account Number (UK) ---
+    acct = data.get("Account_Number")
+    if acct:
+        acct_clean = re.sub(r"\D", "", str(acct))
+        acct_match = re.search(r"\b\d{6,10}\b", acct_clean)
+        clean["Account_Number"] = acct_match.group(0) if acct_match else None
+    else:
+        clean["Account_Number"] = None
+
+    # --- IBAN ---
+    iban = data.get("IBAN")
+    if iban:
+        iban_clean = re.sub(r"\s+", "", str(iban)).upper()
+        iban_match = re.search(r"\b[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}\b", iban_clean)
+        clean["IBAN"] = iban_match.group(0) if iban_match else None
+    else:
+        clean["IBAN"] = None
+
+    return clean
+
+# --- Ensure all_results exists ---
+try:
+    cleaned_results = [validate_and_clean_fields(item) for item in all_results]
+except NameError:
+    raise NameError("⚠️ 'all_results' is not defined. Make sure Gemini extraction code has run first!")
+
+# --- Convert to DataFrame for preview ---
+df_preview = pd.DataFrame(cleaned_results)
+
+# --- Show first 10 rows ---
+print("\n✅ Preview of cleaned results:")
+display(df_preview.head(10))
+
+# --- Optional: flag completely empty rows for manual review ---
+empty_rows = df_preview[df_preview.isnull().all(axis=1)]
+if not empty_rows.empty:
+    print(f"\n⚠️ Rows that may need manual review ({len(empty_rows)}):")
+    display(empty_rows)
+
+# ============================
+# BIGQUERY FORMATTING + EXPORT TO GCS
+# ============================
+
+import io
+import re
+
+# --- Step 1: Format DataFrame for BigQuery ---
+def format_for_bigquery(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cleans all DataFrame columns and text fields for BigQuery:
+    - Remove '.', '/', and other problematic characters
+    - Replace spaces with underscores
+    - Convert to uppercase
+    """
+    # --- Column names ---
+    df.columns = [
+        re.sub(r"[./]", "_", col).replace(" ", "_").upper()
+        for col in df.columns
+    ]
+
+    # --- Clean text fields ---
+    text_cols = [
+        "OFFICE_CODE", "SUPPLIER_CODE", "INVOICE_NO_", "JOB_SCHEDULE_ESTIMATE_NO_", "TOTAL", "LINK",
+        "ACCOUNT_NAME", "SORT_CODE", "ACCOUNT_NUMBER", "IBAN", "STATUS", "EXTRACTION_METHOD"
+    ]
+
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace(r"[./]", "_", regex=True).str.strip()
+
+    return df
+
+# --- Step 2: Export DataFrame to GCS as CSV ---
+def export_to_gcs(df: pd.DataFrame, bucket_name: str, file_name: str):
+    """
+    Export a DataFrame to a Google Cloud Storage bucket as CSV.
+    """
+    if df.empty:
+        print("⚠️ No data to export.")
+        return
+
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_buffer.seek(0)
+
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    blob.upload_from_string(csv_buffer.getvalue(), content_type="text/csv")
+
+    print(f"✅ Exported results to gs://{bucket_name}/{file_name}")
+
+# --- Step 3: Apply formatting ---
+formatted_df = format_for_bigquery(df_preview)  # Replace df_preview with your cleaned results DataFrame
+
+# --- Step 4: Preview before export ---
+print("\n✅ Preview of formatted DataFrame for BigQuery:")
+display(formatted_df.head(10))
+
+# --- Step 5: Export to a different GCS bucket ---
+EXPORT_BUCKET_NAME = "bank_ocr_output"  # Replace with your target bucket
+FILE_NAME = "bank_ocr_cleaned.csv"      # Desired file name
+
+export_to_gcs(formatted_df, EXPORT_BUCKET_NAME, FILE_NAME)
