@@ -160,19 +160,6 @@ def should_process_file(url: str):
     except Exception as e:
         return False, f"Failed to download or validate: {e}", None
 
-def extract_document(file_content: bytes, mime_type: str):
-    try:
-        request = {
-            "name": processor_name,
-            "raw_document": {"content": file_content, "mime_type": mime_type}
-        }
-        result = docai_client.process_document(request=request)
-        text = result.document.text.strip()
-        return text, bool(text)
-    except Exception as e:
-        print(f"❌ Document AI Error: {e}")
-        return "", False
-
 # ============================
 # LOAD EXCEL AND VALIDATE FILES
 # ============================
@@ -204,85 +191,221 @@ if rejected_files:
 print(f"✅ {len(approved_files)} files approved for processing\n")
 
 # ============================
-# DOCUMENT AI BATCH PROCESSING
+# HELPER FUNCTIONS
 # ============================
-current_batch, batch_pages, batch_number = [], 0, 1
-rejected_due_to_pages = []
-invoice_texts = []
+def get_blob_from_gcs_uri(gcs_uri):
+    """Return a blob object from a gs:// URI."""
+    parts = gcs_uri.replace("gs://", "").split("/", 1)
+    bucket_name = parts[0]
+    blob_name = parts[1]
+    return storage_client.bucket(bucket_name).blob(blob_name)
 
-for idx, url, file_bytes in approved_files:
-    ext = url.lower().split('.')[-1]
+
+def extract_text_from_docai_json(document: documentai.Document, doc_json: dict = None) -> str:
+    """Return the extracted text from a Document proto, with robust fallbacks."""
+    # 1) Prefer canonical top-level text
+    try:
+        if getattr(document, "text", None):
+            return document.text.strip()
+    except Exception:
+        pass
+
+    # 2) Fallback: scan JSON recursively for text-like fields
+    if doc_json:
+        found_texts = []
+
+        def _walk_and_collect(o):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k.lower() in ("text", "content", "detected_text", "raw_text") and isinstance(v, str):
+                        s = v.strip()
+                        if s:
+                            found_texts.append(s)
+                    else:
+                        _walk_and_collect(v)
+            elif isinstance(o, list):
+                for item in o:
+                    _walk_and_collect(item)
+            elif isinstance(o, str):
+                s = o.strip()
+                if s:
+                    found_texts.append(s)
+
+        _walk_and_collect(doc_json)
+        if found_texts:
+            return "\n\n".join(found_texts).strip()
+
+    # 3) Try reconstructing from document pages/tokens
+    try:
+        all_text = []
+        for page in getattr(document, "pages", []) or []:
+            for para in getattr(page, "paragraphs", []) or []:
+                layout = getattr(para, "layout", None)
+                if layout and getattr(layout, "text", None):
+                    all_text.append(layout.text)
+            for token in getattr(page, "tokens", []) or []:
+                if getattr(token, "text", None):
+                    all_text.append(token.text)
+                elif getattr(token, "layout", None) and getattr(token.layout, "text", None):
+                    all_text.append(token.layout.text)
+        joined = "\n".join(t.strip() for t in all_text if t and t.strip())
+        if joined:
+            return joined.strip()
+    except Exception:
+        pass
+
+    # 4) Nothing found
+    return ""
+
+
+# ============================
+# 1. STAGE FILES IN GCS
+# ============================
+print(f"--- Staging {len(approved_files)} files for batch processing ---")
+batch_input_configs = []
+staged_file_map = {}
+staged_gcs_uris = []
+
+staging_bucket = storage_client.bucket(DOCAI_STAGING_BUCKET)
+
+for idx, url, file_bytes in tqdm(approved_files, desc="Staging files"):
+    ext = url.lower().split(".")[-1]
     mime_type = {
         "pdf": "application/pdf",
         "png": "image/png",
         "jpg": "image/jpeg",
         "jpeg": "image/jpeg",
-        "tiff": "image/tiff"
+        "tiff": "image/tiff",
     }.get(ext, "application/octet-stream")
-    
-    pages = 1
-    if ext == "pdf":
-        pages = len(PdfReader(io.BytesIO(file_bytes)).pages)
 
-    if batch_pages + pages > DOCAI_MAX_BATCH_PAGES:
-        rejected_due_to_pages.append({"row": idx, "url": url, "reason": f"Exceeded batch page quota ({pages})"})
-        print(f"Row {idx}: ❌ SKIPPED due to batch page limit ({pages})")
-        continue
+    staged_file_name = f"row-{idx}-{uuid.uuid4()}.{ext}"
+    blob = staging_bucket.blob(staged_file_name)
+    blob.upload_from_string(file_bytes, content_type=mime_type)
 
-    current_batch.append((idx, url, file_bytes, mime_type, pages))
-    batch_pages += pages
-    print(f"Row {idx}: Added to batch {batch_number} ({batch_pages} pages)")
+    gcs_uri = f"gs://{DOCAI_STAGING_BUCKET}/{staged_file_name}"
+    staged_gcs_uris.append(gcs_uri)
+    batch_input_configs.append(documentai.GcsDocument(gcs_uri=gcs_uri, mime_type=mime_type))
+    staged_file_map[staged_file_name] = {"row": idx, "url": url}
 
-    # Process batch if full or page limit reached
-    if len(current_batch) >= DOCAI_BATCH_SIZE or batch_pages >= DOCAI_MAX_BATCH_PAGES:
-        print(f"\n--- Processing Batch {batch_number} ({len(current_batch)} files, {batch_pages} pages) ---")
-        
-        # Simple progress bar
-        total_files = len(current_batch)
-        for i, (ri, rurl, rbytes, rmime, rpages) in enumerate(current_batch, start=1):
-            text, used = extract_document(rbytes, rmime)
-            if text:
-                invoice_texts.append({"row": ri, "url": rurl, "text": text})
-            
-            # Print progress bar
-            percent = int(i / total_files * 100)
-            bar = '#' * (percent // 5) + '-' * (20 - percent // 5)
-            print(f"\rProcessing file {i}/{total_files} | [{bar}] {percent}%", end='')
-        
-        print("\nBatch complete.\n")
-        current_batch, batch_pages, batch_number = [], 0, batch_number + 1
-        time.sleep(DOCAI_WAIT_SECONDS)
+print(f"✅ {len(batch_input_configs)} files staged in gs://{DOCAI_STAGING_BUCKET}/\n")
 
-# Final batch
-if current_batch:
-    print(f"\n--- Processing Final Batch {batch_number} ({len(current_batch)} files) ---")
-    total_files = len(current_batch)
-    for i, (ri, rurl, rbytes, rmime, rpages) in enumerate(current_batch, start=1):
-        text, used = extract_document(rbytes, rmime)
-        if text:
-            invoice_texts.append({"row": ri, "url": rurl, "text": text})
-        
-        percent = int(i / total_files * 100)
-        bar = '#' * (percent // 5) + '-' * (20 - percent // 5)
-        print(f"\rProcessing file {i}/{total_files} | [{bar}] {percent}%", end='')
-
-    print("\nFinal batch complete.\n")
 
 # ============================
-# TRACKER SUMMARY
+# 2. RUN ASYNCHRONOUS BATCH JOB
+# ============================
+operation_id = None
+
+if batch_input_configs:
+    print(f"--- Starting Document AI batch job for {len(batch_input_configs)} files ---")
+
+    output_config = documentai.DocumentOutputConfig(
+        gcs_output_config={"gcs_uri": DOCAI_BATCH_OUTPUT_GCS_PATH}
+    )
+
+    request = documentai.BatchProcessRequest(
+        name=processor_name,
+        input_documents=documentai.BatchDocumentsInputConfig(
+            gcs_documents=documentai.GcsDocuments(documents=batch_input_configs)
+        ),
+        document_output_config=output_config,
+    )
+
+    operation = docai_client.batch_process_documents(request)
+
+    # Extract the operation ID
+    operation_id = operation.operation.name.split("/")[-1]
+    print(f"Job started. Waiting for completion... (Operation: {operation.operation.name})")
+
+    try:
+        operation.result(timeout=1800)  # Wait up to 30 mins
+        print("✅ Document AI batch job complete.\n")
+    except Exception as e:
+        print(f"❌ Document AI batch job failed: {e}")
+        raise
+else:
+    print("No files to process.")
+
+
+# ============================
+# 3. PARSE OUTPUT FROM GCS (fixed)
+# ============================
+invoice_texts = []
+
+if operation_id:
+    base_prefix = DOCAI_BATCH_OUTPUT_GCS_PATH.replace("gs://", "").split("/", 1)[1]
+    parse_prefix = f"{base_prefix}{operation_id}"
+    output_bucket_name = DOCAI_BATCH_OUTPUT_GCS_PATH.split("/")[2]
+    output_bucket = storage_client.bucket(output_bucket_name)
+
+    print(f"--- Parsing results from gs://{output_bucket_name}/{parse_prefix}/ ---")
+    blobs = list(output_bucket.list_blobs(prefix=parse_prefix))
+
+    if not blobs:
+        print(f"⚠️ No JSON results found in prefix '{parse_prefix}'")
+
+    for blob in tqdm(blobs, desc="Parsing results"):
+        if not blob.name.endswith(".json"):
+            continue
+
+        doc_json_bytes = blob.download_as_string()
+        try:
+            document = documentai.Document.from_json(doc_json_bytes, ignore_unknown_fields=True)
+        except Exception as e:
+            print(f"W: Failed to parse {blob.name}: {e}")
+            document = None
+
+        # --- FIX: map blob filename back to staged filename ---
+        base_name = blob.name.split("/")[-1]  # e.g., row-1-<uuid>-0.json
+        staged_file_name = None
+        for name in staged_file_map:
+            if base_name.startswith(name.rsplit(".", 1)[0]):
+                staged_file_name = name
+                break
+
+        if not staged_file_name:
+            print(f"W: Could not determine original filename for {blob.name}")
+            continue
+
+        info = staged_file_map[staged_file_name]
+        doc_text = extract_text_from_docai_json(document)
+        if doc_text:
+            invoice_texts.append({
+                "row": info["row"],
+                "url": info["url"],
+                "text": doc_text,
+            })
+        else:
+            print(f"W: {staged_file_name} (Row {info['row']}) had no extracted text.")
+
+    # ============================
+    # CLEANUP
+    # ============================
+    print("Cleaning up staged files...")
+    for gcs_uri in staged_gcs_uris:
+        try:
+            get_blob_from_gcs_uri(gcs_uri).delete()
+        except Exception as e:
+            print(f"W: Failed to delete {gcs_uri}: {e}")
+    print("✅ Staging cleanup complete.\n")
+else:
+    print("--- Skipping parsing (no job run). ---")
+
+
+# ============================
+# 4. FINAL SUMMARY
 # ============================
 print("\n--- Processing Summary ---")
 print(f"Total rows in Excel: {len(df)}")
 print(f"Approved files: {len(approved_files)}")
 print(f"Rejected files: {len(rejected_files)}")
-print(f"Skipped due to batch page quota: {len(rejected_due_to_pages)}")
 print(f"Documents successfully processed: {len(invoice_texts)}")
 
-# Optional: save all extracted texts
-extracted_df = pd.DataFrame(invoice_texts)
-storage_client.bucket("ocr-bank-extractor-bucket").blob("extracted_invoices.csv") \
-    .upload_from_string(extracted_df.to_csv(index=False), content_type="text/csv")
-print("✅ All extracted texts saved to GCS")
+# Save extracted text to GCS
+if invoice_texts:
+    extracted_df = pd.DataFrame(invoice_texts)
+    output_blob = storage_client.bucket("ocr-bank-extractor-bucket").blob("extracted_invoices.csv")
+    output_blob.upload_from_string(extracted_df.to_csv(index=False), content_type="text/csv")
+    print("✅ Extracted texts saved to GCS.")
 
 # ============================
 # GEMINI EXTRACTION HELPER
@@ -357,7 +480,8 @@ current_batch_texts = []
 current_batch_tokens = 0
 batch_number = 1
 
-for idx, text in enumerate(invoice_texts, start=1):
+for idx, invoice in enumerate(invoice_texts, start=1):
+    text = invoice["text"]  # Extract the string from the dict
     tokens = estimate_tokens(text)
     print(f"Invoice {idx}: ~{tokens} tokens")
 
@@ -395,6 +519,9 @@ print(f"❌ Failed extractions: {failure_count}")
 # ============================
 # REGEX VALIDATION / CLEANUP + PREVIEW
 # ============================
+# ============================
+# REGEX VALIDATION / CLEANUP + PREVIEW
+# ============================
 
 import re
 import pandas as pd
@@ -402,7 +529,7 @@ import pandas as pd
 def validate_and_clean_fields(data: dict) -> dict:
     """Clean and validate extracted fields using regex."""
     clean = {}
-    
+
     # Keep row info if exists
     clean["_row"] = data.get("_row", None)
 
@@ -438,24 +565,61 @@ def validate_and_clean_fields(data: dict) -> dict:
 
     return clean
 
-# --- Ensure all_results exists ---
-try:
-    cleaned_results = [validate_and_clean_fields(item) for item in all_results]
-except NameError:
-    raise NameError("⚠️ 'all_results' is not defined. Make sure Gemini extraction code has run first!")
 
-# --- Convert to DataFrame for preview ---
+# ============================
+# Step 1: Combine Gemini results with original invoice info
+# ============================
+
+try:
+    # Ensure previous data exists
+    _ = invoice_texts
+    _ = all_results
+
+    if len(invoice_texts) != len(all_results):
+        raise ValueError(f"Data mismatch: {len(invoice_texts)} texts vs {len(all_results)} results.")
+
+    combined_results = []
+    for i, gemini_dict in enumerate(all_results):
+        # Start with the invoice metadata (row, url, text)
+        base_data = invoice_texts[i].copy()
+
+        # Merge with Gemini extracted fields
+        base_data.update(gemini_dict)
+
+        # Standardize row identifier for cleanup
+        base_data["_row"] = base_data.pop("row", None)
+        combined_results.append(base_data)
+
+    # Step 2: Clean the combined data
+    cleaned_results = [validate_and_clean_fields(item) for item in combined_results]
+
+except NameError as e:
+    raise NameError(
+        f"⚠️ '{e.name}' is not defined. Make sure DocAI and Gemini extraction cells have run first!"
+    )
+
+# ============================
+# Step 3: Convert to DataFrame for preview
+# ============================
+
 df_preview = pd.DataFrame(cleaned_results)
 
-# --- Show first 10 rows ---
-print("\n✅ Preview of cleaned results:")
+# Display first 10 rows
+print("\n✅ Preview of cleaned results (with _row fixed):")
 display(df_preview.head(10))
 
-# --- Optional: flag completely empty rows for manual review ---
-empty_rows = df_preview[df_preview.isnull().all(axis=1)]
+
+# ============================
+# Step 4: Optional flag for completely empty rows
+# ============================
+
+cols_to_check = [c for c in df_preview.columns if c != "_row"]
+empty_rows = df_preview[df_preview[cols_to_check].isnull().all(axis=1)]
+
 if not empty_rows.empty:
     print(f"\n⚠️ Rows that may need manual review ({len(empty_rows)}):")
     display(empty_rows)
+
 
 # ============================
 # BIGQUERY FORMATTING + EXPORT TO GCS
@@ -463,34 +627,38 @@ if not empty_rows.empty:
 
 import io
 import re
+import pandas as pd
 
-# --- Step 1: Format DataFrame for BigQuery ---
+# ----------------------------
+# Step 1: Format DataFrame for BigQuery
+# ----------------------------
 def format_for_bigquery(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Cleans all DataFrame columns and text fields for BigQuery:
-    - Remove '.', '/', and other problematic characters
-    - Replace spaces with underscores
-    - Convert to uppercase
+    Cleans DataFrame columns for BigQuery:
+    - Only column names: remove '.', '/', replace spaces with underscores, uppercase
+    - Text fields: convert to string, handle 'nan', strip spaces (don't remove . or /)
     """
-    # --- Column names ---
-    df.columns = [
-        re.sub(r"[./]", "_", col).replace(" ", "_").upper()
-        for col in df.columns
-    ]
+    df = df.copy()
 
-    # --- Clean text fields ---
+    # Clean column names only
+    df.columns = [re.sub(r"[./]", "_", str(col)).replace(" ", "_").upper() for col in df.columns]
+
+    # Text fields to clean (without replacing . or /)
     text_cols = [
         "OFFICE_CODE", "SUPPLIER_CODE", "INVOICE_NO_", "JOB_SCHEDULE_ESTIMATE_NO_", "TOTAL", "LINK",
-        "ACCOUNT_NAME", "SORT_CODE", "ACCOUNT_NUMBER", "IBAN", "STATUS", "EXTRACTION_METHOD"
+        "ACCOUNT_NAME", "SORT_CODE", "ACCOUNT_NUMBER", "IBAN", 
     ]
 
     for col in text_cols:
         if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(r"[./]", "_", regex=True).str.strip()
+            # Convert to string, handle 'nan', and strip spaces
+            df[col] = df[col].astype(str).replace('nan', '').str.strip()
 
     return df
 
-# --- Step 2: Export DataFrame to GCS as CSV ---
+# ----------------------------
+# Step 2: Export DataFrame to GCS as CSV
+# ----------------------------
 def export_to_gcs(df: pd.DataFrame, bucket_name: str, file_name: str):
     """
     Export a DataFrame to a Google Cloud Storage bucket as CSV.
@@ -509,15 +677,77 @@ def export_to_gcs(df: pd.DataFrame, bucket_name: str, file_name: str):
 
     print(f"✅ Exported results to gs://{bucket_name}/{file_name}")
 
-# --- Step 3: Apply formatting ---
-formatted_df = format_for_bigquery(df_preview)  # Replace df_preview with your cleaned results DataFrame
 
-# --- Step 4: Preview before export ---
+# ----------------------------
+# Step 3: Merge cleaned extraction results with original Excel columns
+# ----------------------------
+def _find_original_column(df, target):
+    """Find a column in df that matches target ignoring case, spaces, or underscores."""
+    tkey = re.sub(r"[ _./]", "", target).lower()
+    for c in df.columns:
+        if re.sub(r"[ _./]", "", str(c)).lower() == tkey:
+            return c
+    return None
+
+# Build cleaned results DataFrame
+try:
+    cleaned_df = df_preview.copy()
+except NameError:
+    raise NameError("⚠️ 'df_preview' is not defined. Run the 'REGEX VALIDATION' cell first!")
+
+# Prepare original Excel with a matching _row column
+orig_df = df.copy()
+orig_df['_row'] = orig_df.index + 1
+
+# Columns to bring from original Excel
+orig_wanted = [
+    "OFFICE_CODE", "SUPPLIER_CODE", "INVOICE_NO_", "JOB_SCHEDULE_ESTIMATE_NO_", "TOTAL", "LINK"
+]
+
+# Select original columns, mapped to desired names
+orig_selected = pd.DataFrame({'_row': orig_df['_row']})
+for cname in orig_wanted:
+    match = _find_original_column(orig_df, cname)
+    orig_selected[cname] = orig_df[match] if match else ""
+
+# Ensure _row is integer for merging
+cleaned_df['_row'] = pd.to_numeric(cleaned_df['_row'], errors='coerce')
+orig_selected['_row'] = pd.to_numeric(orig_selected['_row'], errors='coerce')
+
+# Merge original columns with cleaned extraction
+merged = pd.merge(orig_selected, cleaned_df, on='_row', how='left')
+
+# ----------------------------
+# Step 4: Final formatting and column ordering
+# ----------------------------
+desired_cols = [
+    "OFFICE_CODE", "SUPPLIER_CODE", "INVOICE_NO_", "JOB_SCHEDULE_ESTIMATE_NO_", "TOTAL", "LINK",
+    "ACCOUNT_NAME", "SORT_CODE", "ACCOUNT_NUMBER", "IBAN"
+]
+
+# Normalize column names
+merged.columns = [re.sub(r"[./]", "_", str(col)).replace(" ", "_").upper() for col in merged.columns]
+
+# Ensure all desired columns exist
+for col in desired_cols:
+    if col not in merged.columns:
+        merged[col] = ""
+
+# Final DataFrame: desired columns first, then any extras
+extra_cols = [c for c in merged.columns if c not in desired_cols]
+final_cols = desired_cols + extra_cols
+final_df = merged.reindex(columns=final_cols)
+
+# ----------------------------
+# Step 5: Clean values for BigQuery and export
+# ----------------------------
+final_df = format_for_bigquery(final_df)
+
+# Preview
 print("\n✅ Preview of formatted DataFrame for BigQuery:")
-display(formatted_df.head(10))
+display(final_df.head(10))
 
-# --- Step 5: Export to a different GCS bucket ---
-EXPORT_BUCKET_NAME = "bank_ocr_output"  # Replace with your target bucket
-FILE_NAME = "bank_ocr_cleaned.csv"      # Desired file name
+# Export
+export_to_gcs(final_df, EXPORT_BUCKET_NAME, FILE_OVERWRITE_NAME)
 
-export_to_gcs(formatted_df, EXPORT_BUCKET_NAME, FILE_NAME)
+
